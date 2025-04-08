@@ -17,7 +17,7 @@ import time
 import asyncio
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
-import datetime
+
 from dateutil import parser
 load_dotenv()
 
@@ -469,10 +469,11 @@ def fetch_daemon_details(daemon_id):
     
     return None
 
-EXPIRATION_DATE = datetime.datetime.now() + datetime.timedelta(days=7)
+EXPIRATION_DATE = datetime.now() + timedelta(days=4)
+
 def check_expiration():
     """Check if the bot has expired"""
-    current_time = datetime.datetime.now()
+    current_time = datetime.now()
     if current_time > EXPIRATION_DATE:
         print("⚠️ BOT HAS EXPIRED - PLEASE REMOVE OR RENEW ⚠️")
         return True
@@ -1120,8 +1121,8 @@ async def post_random_daemon_insight():
         print("Bot expired - stopping background task")
         post_random_daemon_insight.stop()
         return
-    #channel_id = 1357672485738516675
-    channel_id = 1356240994512670735  # Replace with your Discord channel ID
+    channel_id = 1357672485738516675
+    #channel_id = 1356240994512670735  # Replace with your Discord channel ID
     channel = bot.get_channel(channel_id)
     
     if not channel:
@@ -1323,8 +1324,8 @@ async def on_ready():
     
     # Try sending startup message to a specific channel
     try:
-        startup_channel_id = 1356240994512670735  # Replace with your announcement channel
-        #startup_channel_id = 1357672485738516675  # Replace with your announcement channel
+        #startup_channel_id = 1356240994512670735  # Replace with your announcement channel
+        startup_channel_id = 1357672485738516675  # Replace with your announcement channel
         channel = bot.get_channel(startup_channel_id)
         if channel:
             await channel.send("🎮 Daemons Assistant is now online! Ask me anything about Daemons using `!daemon [question]` or by mentioning me.")
