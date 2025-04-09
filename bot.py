@@ -23,6 +23,7 @@ load_dotenv()
 
 # Access the environment variables
 openai_api_key = os.getenv("OPENAI_API_KEY")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
 client = OpenAI(api_key=openai_api_key)
 bot_token = os.getenv("DISCORD_BOT_TOKEN")
 
@@ -471,13 +472,7 @@ def fetch_daemon_details(daemon_id):
 
 EXPIRATION_DATE = datetime.now() + timedelta(days=4)
 
-def check_expiration():
-    """Check if the bot has expired"""
-    current_time = datetime.now()
-    if current_time > EXPIRATION_DATE:
-        print("⚠️ BOT HAS EXPIRED - PLEASE REMOVE OR RENEW ⚠️")
-        return True
-    return False
+
 # Generate response for queries using RAG
 def generate_response(query: str, context: List[Dict[str, Any]]):
     """Generate a response using RAG with context retrieval"""
@@ -1106,7 +1101,8 @@ If below 50% Health deals 35 - 40 damage but has a 30% chance to Freeze you, dis
                 {"role": "user", "content": prompt}
             ],
             temperature=0.5,  # Lower temperature for more factual responses
-            max_tokens=800
+            max_tokens=800,
+            timeout=20.0
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -1117,16 +1113,13 @@ If below 50% Health deals 35 - 40 damage but has a 30% chance to Freeze you, dis
 @tasks.loop(hours=24)
 async def post_random_daemon_insight():
     """Post daily insights about Daemons"""
-    if check_expiration():
-        print("Bot expired - stopping background task")
-        post_random_daemon_insight.stop()
-        return
-    channel_id = 1357672485738516675
-    #channel_id = 1356240994512670735  # Replace with your Discord channel ID
+    
+    channel_id = int(CHANNEL_ID) if CHANNEL_ID else None
+    
     channel = bot.get_channel(channel_id)
     
     if not channel:
-        print("Channel not found for insights post.")
+        print(f"Channel not found for insights post. Channel ID:{channel_id}")
         return
     
     try:
@@ -1156,9 +1149,7 @@ async def post_random_daemon_insight():
 @bot.command(name="daemon")
 async def answer(ctx, *, question: str):
     """Answer questions about Daemons"""
-    if check_expiration():
-        await ctx.send("❌ This bot has expired and is no longer functional. Please contact the developer.")
-        return
+    
     try:
         # Show typing indicator
         async with ctx.typing():
@@ -1171,6 +1162,7 @@ async def answer(ctx, *, question: str):
                 description=response,
                 color=0x9B59B6  # Purple color
             )
+            print("from command", embed)
             
             # Add sources if available
             if relevant_docs:
@@ -1286,21 +1278,25 @@ async def on_message(message):
     # Ignore bot's own messages
     if message.author == bot.user:
         return
-    if check_expiration():
-        await message.channel.send("❌ This bot has expired and is no longer functional. Please contact the developer.")
-        return
+    
     
     print(message.content)
     # Process commands first
-    await bot.process_commands(message)
+    
+    # Process command ONLY if it starts with the prefix
+    if message.content.startswith(bot.command_prefix):
+        await bot.process_commands(message)
+        return
 
     # Then handle direct mentions
-    if bot.user.mentioned_in(message) and not message.mention_everyone:
+    #if bot.user.mentioned_in(message) and not message.mention_everyone:
+    if bot.user.mentioned_in(message) and not message.content.startswith(bot.command_prefix):
         question = message.content.replace(f'<@{bot.user.id}>', '').strip()
         if question:
             async with message.channel.typing():
                 relevant_docs = vectorstore.retrieve(question)
                 response = generate_response(question, relevant_docs)
+                print('from direct', response)
                 await message.reply(response)
         else:
             await message.channel.send("How can I help you with information about Daemons?")
@@ -1324,8 +1320,8 @@ async def on_ready():
     
     # Try sending startup message to a specific channel
     try:
-        #startup_channel_id = 1356240994512670735  # Replace with your announcement channel
-        startup_channel_id = 1357672485738516675  # Replace with your announcement channel
+        
+        startup_channel_id = CHANNEL_ID  # Replace with your announcement channel
         channel = bot.get_channel(startup_channel_id)
         if channel:
             await channel.send("🎮 Daemons Assistant is now online! Ask me anything about Daemons using `!daemon [question]` or by mentioning me.")
