@@ -71,6 +71,78 @@ class ChromaVectorstore:
                     if not page_title:
                         page_title = title
                     
+                       # Special handling for tables - add this new section
+                    table_content = ""
+                    if "daemon-ultimates" in url:
+                        print("Detected Daemon Ultimates page with tables, using special extraction...")
+                    
+                    # Try to extract table content using JavaScript
+                    table_content = await page.evaluate("""() => {
+                        const tables = document.querySelectorAll('[role="table"]');
+                        let result = '';
+                        
+                        tables.forEach(table => {
+                            // Get headers
+                            const headers = Array.from(table.querySelectorAll('[role="columnheader"]'))
+                                .map(header => header.textContent.trim());
+                            
+                            result += headers.join(' | ') + '\\n';
+                            result += headers.map(() => '---').join(' | ') + '\\n';
+                            
+                            // Get rows - FIXED: Include all rows, not just those after first child
+                                const rows = table.querySelectorAll('[role="row"]');
+                                // Skip the header row (first row)
+                                for (let i = 1; i < rows.length; i++) {
+                                    const row = rows[i];
+                                    const cells = Array.from(row.querySelectorAll('[role="cell"]'))
+                                        .map(cell => cell.textContent.trim());
+                                    result += cells.join(' | ') + '\\n';
+                                }
+                                
+                                result += '\\n\\n';
+                            });
+                        
+                        return result;
+                    }""")
+                    # Add this new section to extract simple content paragraphs
+                    simple_content = await page.evaluate("""() => {
+                        // Target the main content div and its paragraphs
+                        const contentDivs = document.querySelectorAll('div[class*="grid"]');
+                        let result = '';
+                        
+                        contentDivs.forEach(div => {
+                            // Get all paragraphs inside this div
+                            const paragraphs = div.querySelectorAll('p');
+                            paragraphs.forEach(p => {
+                                const text = p.textContent.trim();
+                                if (text) {
+                                    result += text + '\\n\\n';
+                                }
+                            });
+                        });
+                        
+                        // Also try to get content from specific elements that might contain important text
+                        const headerText = document.querySelector('h1')?.textContent || '';
+                        const subheaderText = document.querySelector('header p')?.textContent || '';
+                        
+                        if (headerText) {
+                            result = '# ' + headerText + '\\n\\n' + result;
+                        }
+                        
+                        if (subheaderText && subheaderText !== 'RESERVED') {
+                            result = result + 'Note: ' + subheaderText + '\\n\\n';
+                        }
+                        
+                        return result;
+                    }""")
+                    
+                    if simple_content:
+                        print(f"Successfully extracted simple content: {len(simple_content)} characters")
+                        print(f"Content preview: {simple_content[:200]}...")
+                    
+                    if table_content:
+                        print(f"Successfully extracted table content: {len(table_content)} characters")
+                    
                     # Extract content - try multiple selectors
                     selectors = [
                         "main", 
@@ -80,7 +152,8 @@ class ChromaVectorstore:
                         ".docusaurus-content",
                         "[role='main']",
                         ".container main",
-                        ".markdown"
+                        ".markdown",
+                        "table"
                     ]
                     
                     content_html = None
@@ -100,6 +173,34 @@ class ChromaVectorstore:
                         body = await page.query_selector("body")
                         if body:
                             content_html = await body.inner_html()
+                     # If we have table content, add it as a special chunk
+                    if table_content or simple_content:
+                        # Create unique ID for the table chunk
+                        parsed_url = urlparse(url)
+                        path_parts = parsed_url.path.strip('/').split('/')
+                        path_id = '-'.join(path_parts) if path_parts else 'root'
+                        # Add table content if available
+                        if table_content:
+                            chunk_id = f"{path_id}-table"
+                            results.append({
+                                "id": chunk_id,
+                                "title": f"{page_title} - Table Data",
+                                "text": f"Table of Daemon Ultimates:\n\n{table_content}",
+                                "url": url,
+                                "timestamp": datetime.now().isoformat()
+                            })
+                        # Add simple content if available
+                        if simple_content:
+                            chunk_id = f"{path_id}-simple"
+                            results.append({
+                                "id": chunk_id,
+                                "title": f"{page_title} - Basic Information",
+                                "text": simple_content,
+                                "url": url,
+                                "timestamp": datetime.now().isoformat()
+                            })
+                    
+                        
                         
                     if content_html:
                         # Use BeautifulSoup to parse the extracted HTML
@@ -347,7 +448,7 @@ class ChromaVectorstore:
             except Exception as e:
                 print(f"❌ Error adding documents to ChromaDB: {e}")
 
-    def retrieve(self, query: str, top_k=3) -> List[Dict[str, Any]]:
+    def retrieve(self, query: str, top_k=20) -> List[Dict[str, Any]]:
             """Retrieve relevant documents for a query"""
             try:
                 # Get query embedding
@@ -411,6 +512,7 @@ documents = [
     {"title": "Daemons Roadmap", "url": "https://docs.daemons.app/what-is-daemons/daemons-roadmap"},
     {"title": "Daemons Partners", "url": "https://docs.daemons.app/what-is-daemons/daemons-partners"},
     {"title": "Daemons Assets", "url": "https://docs.daemons.app/daemons-assets"},
+    {"title": "Daemons crosschain Gaming", "url":"https://docs.daemons.app/what-is-daemons/crosschain-gaming"},
     {"title": "Daemons Lore", "url": "https://docs.daemons.app/lore"},
     {"title": "Daemons Onboarding", "url": "https://docs.daemons.app/gameplay/onboarding"},
     {"title": "Daemons App Overview", "url": "https://docs.daemons.app/gameplay/application-overview"},
@@ -481,11 +583,21 @@ def generate_response(query: str, context: List[Dict[str, Any]]):
         f"{doc['title']} (Source: {doc['url']}):\n{doc['text']}" 
         for doc in context
     ])
-    
+    # Print the context data being sent to the LLM
+    print("\n--- VECTOR DATA SENT TO LLM ---")
+    print(f"Query: {query}")
+    print(f"Number of context documents: {len(context)}")
+    for i, doc in enumerate(context):
+        print(f"\nDocument {i+1}:")
+        print(f"Title: {doc['title']}")
+        print(f"URL: {doc['url']}")
+        print(f"Distance: {doc.get('distance', 'N/A')}")
+        print(f"Text snippet: {doc['text'][::]}...")  # Print first 150 chars of text
+    print("--- END OF VECTOR DATA ---\n")
     # Create system prompt with specific instructions
     system_prompt = """
     You are Daemons Assistant, a helpful AI specialized in answering questions about Daemons - the blockchain game 
-    that transforms on-chain activity into an interactive Daemon (pet). 
+    that transforms on-chain activity into an interactive Daemon (pet).
     
     Daemons is a Tamagotchi and Pokémon-inspired blockchain game with:
     - On-chain activity generating custom Pokémon-style pets
@@ -495,600 +607,15 @@ def generate_response(query: str, context: List[Dict[str, Any]]):
     - AI interactive chat with your Daemon
     - Earning through revenue share and Daemon Soul Points for $DMN airdrops
     
-  
-Dæmons Docs
-Welcome to Dæmons!
-Dæmons is a Tamagotchi and Pokémon-inspired blockchain game that transforms on-chain activity into a custom, interactive Dæmon (pet).
-
-Features
-🐺 On-chain activity generating a custom, Pokémon style pet.
-
-💪 Raise, train and evolve your Dæmon.
-
-⚔️ PvP. Turn based 1v1, community “Clan” tournaments, and matchmaking. 👀
-
-🗺️ PvE. Unique AI-generated challenges tailored to your blockchain history and content preferences.
-
-🤖 AI interactive chat with your Dæmon.
-
-🎁 Earning application and referral revenue share, and Dæmon Soul Points which translate to a $DMN airdrop.
-
-QuickStart​
-Install the app​
-You can install the mobile app directly from the website on XXX (Closed Alpha Testing only at this stage).
-
-To install: Once on the website, open your browser Menu (click on the 3 dots) > "Add to Home Screen"
-
-The game is now available on your device like any other app. You can then connect to the game using your favorite crypto wallet (EVM and/or Solana).
-
-Follow the onboarding​
-Once you are connected, you will be redirected to our Onboarding flow.
-
-You will then be able to:
-
-Name your account.
-
-Discover your most used chains and protocols, which combined with the NFTs you hold in your wallet will give you a range of Dæmon and Accessory options!
-
-Mint your first character (Dæmon and Accessory combination) that reflects your blockchain history.
-
-And voilà. You can now enjoy the game, and get into battle! ⚔️
-What is Dæmons?
-Vision & Opportunity
-Why Dæmons?
-
-
-2
-
-👁️ Our Vision
-Every web3 user has their own Dæmon - a living, playable version of their blockchain history.
-
- 🔮 Market Opportunity:
-A fragmented GameFi ecosystem across many chains.
-
-A disconnect between on-chain activity, and a feeling of connectivity, fun, and reward.
-
-A market demand for simple, accessible and nostalgic gaming products.
-
-3
-
-Dæmons Roadmap
-The major milestones on our journey
-
-Mid-2024
-Dæmons is born 🔥
-
-November 2024
-Dæmons Limited NFT Sale. 
-
-Five styles of pixel art NFT were sold, from three different pixel artists. 
-
-Each mint was a vote for the style of art the community wanted to see in the game.
-
-Additionally, it was a vote for the blockchain(s) that the community wanted to see us deploy on.
-
-Learn more about the Dæmons early concept NFTs and their value proposition here.
-
-December 2024
-Dæmons Launch $DMNAI on Virtuals. Learn more about $DMNAI and it's value proposition here. 
-
-March/April 2025
-⭐ (Ongoing) Dæmons Incentivized Closed Alpha! Two Phases of testing to achieve the following intent: Rigorous evaluation of the core mechanics, functionality, and user experience of Dæmons before moving to a Beta/Public release. This being to ensure a smooth and engaging experience at launch whilst identifying and fixing critical bugs and gameplay imbalances.
-
-April/May 2025
-Auditing, and final feature additions.
-
-May 2025
-Dæmons Launch! Initial clan tournaments starting immediately!
-
-Q3 2025
-Dæmons TGE and Airdrop.
-
-Q3-Q4 2025
-Feature Expansion #1: Initial PvE experiences.
-New Dæmons and Accessories added, expansions to levelling roadmaps.
-
-Q1-Q2 2026
-Feature Expansion #2: Unique, tailored and immersive PvE experiences and challenges based on a players blockchain history, social activity, and content preferences.
-
-2026 - 2027 and beyond
-Further feature expansions, pivoting and adapting rapidly.
-
-Dæmons is simple, retro and modular in appearance with some amazing technology under the hood. We have the ability to pivot fast and capture trends and excitement - staying with or ahead of the curve at all times.
-
-Nimble, like the Furicane.
-
-***
-What is Dæmons?
-Dæmons Roadmap
-The major milestones on our journey
-
-Mid-2024
-Dæmons is born 🔥
-
-November 2024
-Dæmons Limited NFT Sale. 
-
-Five styles of pixel art NFT were sold, from three different pixel artists. 
-
-Each mint was a vote for the style of art the community wanted to see in the game.
-
-Additionally, it was a vote for the blockchain(s) that the community wanted to see us deploy on.
-
-Learn more about the Dæmons early concept NFTs and their value proposition here.
-
-December 2024
-Dæmons Launch $DMNAI on Virtuals. Learn more about $DMNAI and it's value proposition here. 
-
-March/April 2025
-⭐ (Ongoing) Dæmons Incentivized Closed Alpha! Two Phases of testing to achieve the following intent: Rigorous evaluation of the core mechanics, functionality, and user experience of Dæmons before moving to a Beta/Public release. This being to ensure a smooth and engaging experience at launch whilst identifying and fixing critical bugs and gameplay imbalances.
-
-April/May 2025
-Auditing, and final feature additions.
-
-May 2025
-Dæmons Launch! Initial clan tournaments starting immediately!
-
-Q3 2025
-Dæmons TGE and Airdrop.
-
-Q3-Q4 2025
-Feature Expansion #1: Initial PvE experiences.
-New Dæmons and Accessories added, expansions to levelling roadmaps.
-
-Q1-Q2 2026
-Feature Expansion #2: Unique, tailored and immersive PvE experiences and challenges based on a players blockchain history, social activity, and content preferences.
-
-2026 - 2027 and beyond
-Further feature expansions, pivoting and adapting rapidly.
-
-Dæmons is simple, retro and modular in appearance with some amazing technology under the hood. We have the ability to pivot fast and capture trends and excitement - staying with or ahead of the curve at all times.
-
-Nimble, like the Furicane.
-
-**
-What is Dæmons?
-Dæmons Partners
-All of Dæmons Chain, Protocol, NFT, Guild and other Partners! (Updated regularly)
-
-Dæmons Chain Partners:
-Polygon
-
-Ancient8
-
-Sonic
-
-Monad
-
-Base
-
-More TBA.
-
-Dæmons Launch Partners:
-This is presently our highest Tier of Partnership. Every member of their NFT/Token Community (holding a TBD amount of Tokens) will be eligible for their first Free Dæmon Character, plus being able to make a Community Clan in our Game to take part in PvP Tournaments. We are also exploring creative integrations with some!
-
-PixelRealm
-
-Persona
-
-Moody Mights
-
-SNACKGANG
-
-Gm DAO
-
-wallet.garden
-
-Goblins
-
-GGEM Launcher
-
-Wolia Games AI
-
-Galactica, Cypher University
-
-Socials Rising
-
-BattleRise
-
-Solana Heroes
-
-SmithyDAO
-
-3dFrankenPunks
-
-Nekito
-
-Agora
-
-Companeons
-
-Dæmons Collabs / (non-Launch) Partners
-These Partnerships all involve various levels of mutual support and potential future integration. All have involved giveaways or a collab of some sort, and some may lead to Launch Partnerships in time.
-
-XBorg
-
-Sovrun
-
-Smolbrains
-
-Bitshaders
-
-PWNAGE Guild
-
-Crypto Cove
-
-Operation Safe Space
-
-Chedda Finance
-
-Puri on Solana
-
-Nova AI Agent
-
-Open Colosseum
-
-Dackieverse
-
-Tilted
-
-Gaia
-
-**
-
-Dæmons Assets
-Information about the assets sold by, or associated with the Dæmons Project, and their value propositions.
-
-Live assets include our Concept NFTs and Virtuals Token $DMNAI.
-
-Dæmons Concept NFT
-Key Details:
-Sold: November 2024.
-
-Collection size: 424.
-
-Secondary sale link: https://opensea.io/collection/daemons-concepts
-
-Value Proposition (minters):
-
-A free mint Dæmon character when the game is released for each mint during the sale.
-
-Boosted Dæmon Soul points (your ticket for $DMN).
-
-A vote on the pixel art style for the game, and the initial launch chain(s).
-
-A VIP role in Discord for additional giveaways, alpha and rewards boosts.
-
-Minting 5: An invitation to the Closed Alpha Testing period + the ability to mint one of the first #100 Dæmons in an early allocation before a full public release starts.
-
-Value Proposition (secondary purchases):
-
-A free mint Dæmon character when the game is released at snapshot (TBD).
-
-Boosted Dæmon Soul points (your ticket for $DMN).
-
-A VIP role in Discord for additional giveaways, alpha and rewards boosts.
-
-
-The Base Sentinel. Bases Dæmon
-Virtuals Token $DMNAI
-Key Details:
-Launched: December 2024 (through the Virtuals Platform).
-
-Total tokens: 1,000,000,000
-
-Link: https://app.virtuals.io/prototypes/0x331B9a47bd75F125a81DeEdF61C55Aa20E9DBd4B
-
-Why Launch on Virtuals?
-
-The perpetual question we ask as a team is, how can we bring the vision of Dæmons forward? What can we do to bring eyes, attention, resource and excitement to Dæmons, and pivot wherever necessary, with the relentless goal of reaching our vision. To that end, we saw a market opportunity with Virtuals, and a value proposition we could add to our brand as an AI x Gaming project in launching a token through their platform.
-
-$DMNAI Value Proposition:
-
-Holding $DMNAI guarantees a 30+ (TBD) % allocation to the $DMN Airdrop, and any other token delivered by us which the Virtuals Agent supports us in building/promoting.
-
-A VIP role in Discord for additional giveaways, alpha and rewards boosts if you hold 100,000 or more $DMNAI.
-
-The "Dæmons CEO" (the name of the Virtuals Agent) intends to manage an X account and have other functionality (once red pilled) to be engaging, educational and fun as a separate value proposition!
-
-**
-
-Lore
-RESERVED
-
-**
-
-Gameplay
-Onboarding
-After connecting, you will be able to choose your Player/Account name, this will be your unique identifier across your characters. Following that, you will journey to the rest of the onboarding experience, which is focussed around character creation.
-
-Your characters in Dæmons are comprised of a Dæmon and Accessory combination 🔥
-
-Dæmons Options
-When onboarding you will have at least 3 options for your first Dæmon with a fresh wallet. 
-
-The 3 base options (the Dæmons originals) are:
-
-Furicane
-
-Amberclaw
-
-One more to be revealed
-
-You will also have 3 or more additional choices depending on your most used chains and the NFTs held in your wallet. In the example below, I will be able to choose from the 3 base options, and the Dæmons which represent Base, Arbitrum and Ethereum.
-
-
-Chain Analysis Example
-Accessory Options
-You will also have at least 3 options for your first Accessory with a fresh wallet. 
-
-The 3 base options (the Dæmons originals) are:
-
-Dæmons Compass
-
-Jupitor Orb
-
-Orchestra of Doom
-
-(Subject to change)
-
-You will also have 3 or more additional choices depending on your most used Protocols and the NFTs held in your wallet. In the example below, I will be able to choose from the 3 base options, and the Accessories which represent Synthetix, Uniswap and Pendle.
-
-
-Protocol Analysis Example
-Minting
-Once you have made the tough choice of your first Dæmon and Accessory combination, it's time to mint and get started!
-
-Your first character will start at rank 1 of it's evolution cycle, and be able to reach rank 3 (or further in the future!).
-
-(Don't worry, you can always mint more!)
-
-
-Minting
-
-**
-
-Gameplay
-Application Overview
-The Dæmons Application presently consists of:
-
-Onboarding.
-
-A Home "Dæmons" Page, which has the following functionality:
-
-Minting new Dæmons (from the "Dæmons!" drop down tab at the top of the page).
-
-Entering into the PvP / PvE.
-
-Seeing your Dæmons stats, score and points at a glance.
-
-Feeding your Dæmons and seeing the active challenge/quests available.
-
-More TBA
-
-An Account Page, which has the following functionality:
-
-Claiming rewards.
-
-Turning on/off dark mode.
-
-Turning on/off the game music.
-
-More TBA.
-
-An AI Chat Page, where you can talk to your Dæmons as AI Agents in the app. There they will have a context history of our docs, and the docs of our Chain and Launch Partners.
-
-A Codex, which has the following functionality:
-
-Seeing the Dæmons you own, or have unlocked by beating the character in battle.
-
-Seeing the Accessories you own, or have unlocked by beating the character in battle.
-
-Seeing the Evolution roadmap of your character, unlocked by leveling up. Here you will be able to choose an Accessory mechanic to power-up your Dæmons for battle.
-
-More TBA.
-
-A PvP Tab, which has the following functionality:
-
-Activity view, to see your characters wins and losses in combat.
-
-Leaderboard view (filterable), to see your character and clans standing on the leaderboard, or to battle a specific clan, player or Dæmon.
-
-Clan view, to see your Clan in detail, including total clan points, position in the current tournament, and clan individual rankings.
-
-The PvP Tab itself is expandable to full screen view.
-
-More TBA.
-
-Pre-Alpha Gameplay Demo
-
-**
-Gameplay
-PvP Overview
-How to enter into PvP, and navigating the screen.
-
-In the Leaderboard section of the PvP tab, you will see the players that are available to attack.
-
-Press the ⚔️ next to the player to engage in a PvP match. At this point you will be able to decide which character you take into battle, and which opponent character you want to verse. 
-
-PvP Combat Overview
-After a short loading screen, you will see your Dæmon ready for battle against your opponent. 
-
-Combat will not start until you make your first move, at which point a 30 second timer will be present for each player to decide on subsequent moves.
-
-Abilities are as follows:
-
-Attack Type
-Description in Game
-Wallet refill (Basic Attack)
-
-Top up your wallet, giving your Daemon the funds and endurance to attack the opponent for 12-16 damage.
-
-#Cope
-
-Pray to any God who will listen, and delude yourself into unimaginable power if you are lucky. At the cost of 0 - 20 HP, you have a 10% chance of dealing 30 - 40 damage (desperation move). Can be used once per match.
-
-#Shill
-
-Shill your Daemons bags. Lifedrain from your opponent and take that health for yourself. Deal 8 - 12 damage, and restore the same amount of health. Can be used once every 3 turns.
-
-Ultimate Attack
-
-Each Dæmon gets their own, can be used once per battle.
-
-You will be able to see your Health (HP) and XP in the top left. 
-
-Below that, there is an (X) escape button if you would like to forfeit the match (this will result in a loss).
-
-To the right, you will see an information icon. If pressed, you will see your abilities (as per above), plus the unique description for your Dæmons Ultimate ability.
-
-
-PvP initiation.
-
-Information icon example.
-
-**
-
-Gameplay
-Dæmon Ultimates
-A Page for you to see the presently released rank 2 Dæmon Ultimate abilities, their names, damage and descriptions in the game.
-
-CAVEAT: 
-
-All ultimates are subject to change during and after the Closed Alpha.
-
-More Dæmons are being made for the full launch for you to discover that will not be added here.
-
-Chain
-Base Daemon
-Ultimate Move
-Description in Game
-Ethereum
-
-Ethereal Stag
-
-Vitalik’s Vision
-
-A visionary laser beam deals 40 - 45 damage. However, the beam takes so long to charge that your opponent can attack again before it is fired.
-
-Binance Smart Chain
-
-Binance Whale
-
-Regulatory Beatdown
-
-Deals 30 - 35 damage but has a 50% chance to self-inflict 5 - 10 damage for "attracting the SEC’s attention."
-
-Solana
-
-Solar Phoenix
-
-SolFlare Nova
-
-Deals 20 - 25 base damage and then roles a six sided dice like a true Solana Degen.
-1 = take 10 damage. 2 = take 5 damage. 3 = deal an extra 5 damage. 4 = deal an extra 10 damage. 5 = deal an extra 15 damage. 6 = deal an extra 20 damage.
-
-Arbitrum
-
-Azure Chimera
-
-Blue Chip Burn
-
-Deals 20 - 25 damage and heals for half that amount because "you dumped your $ARB tokens for $ETH.", 10% chance to lose 5 - 10 HP due to transaction fees.
-
-Base
-
-Base Sentinel
-
-Centralized Crush
-
-Deals 30 - 35 damage but has a 25% chance to disable your next turn because "Coinbase froze your account."
-
-Polygon
-
-Poly Hydra
-
-Validator’s Venom
-
-Hits 3 times for each new corporate partnership, dealing 12 - 16 damage per hit. Each hit has a 25% chance to miss.
-
-Avalanche
-
-Snow Bear
-
-Seismic Extinction
-
-Deals 30 - 35 damage but has a 25% chance to cause a self-inflicted “collapse,” taking 10 - 15 HP from you.
-
-Optimism
-
-Optimistic Sparrow
-
-Fibonacci Funnel
-
-Heals 20 - 25 HP and blocks 10 - 20 damage from the next attack, but your next move deals 5 - 10 less damage because "you got carried away with optimism."
-
-Sonic/ Fantom
-
-Sonic Wraith
-
-Cronje's Clutch
-
-Deals 20 - 35 damage but makes your next move a random cast because “Andre confused you.”
-
-Linea
-
-Linea Lynx
-
-Astrorekt
-
-Deals 30 - 35 damage but costs 0 - 10 health because “you pushed engagement campaigns to exploitative levels.”
-
-Zksync
-
-Encrypted Kitsune
-
-Zk-Sync or Swim
-
-Deals 25 - 30 damage and heals 5 - 15 HP, but has a 30% chance to "miss entirely because you didn’t qualify."
-
-Ancient8
-
-Neural Nexus
-
-AI Apocalypse
-
-Deals 30 - 45 damage but halves your health because "your AI turned against you."
-
-No Chain afiliation
-
-Furicane
-
-Stratospark Fury
-
-Overload every bitcoin miner globally and deal 20 - 30 damage and increase your next Basic Attack by 5 damage with an uncontrollable burst of lightning.
-
-No Chain afiliation
-
-Amberclaw
-
-Razor Revolve
-
-Deal 20 - 30 damage if your opponent is above 50% health, and 30 - 40 damage if your opponent is below 50% health. This move damages you 5 - 10 health on use from over spinning.
-
-Pudgy Penguins (NFT)
-
-Pudgy
-
-Penguin's Permafrost
-
-If above 50% Health deals 25 - 30 damage but has a 15% chance to Freeze you, disabling your next turn.
-If below 50% Health deals 35 - 40 damage but has a 30% chance to Freeze you, disabling your next turn.
-  Answer questions using ONLY the context provided. If you don't know the answer from the context, say 
-    "I don't have specific information about that in my knowledge base."
+    Answer questions using ONLY the context provided. When information is marked as "RESERVED" or "to be revealed", 
+    explicitly state this instead of saying you don't have information. If the context indicates something will be 
+    revealed in the future, specify this timing information.
+    
+    If you genuinely don't find any relevant information in the context, say 
+    "I don't have specific information about that in my knowledge base. You could try rephrasing it, or be more specific."
     
     Keep responses concise and to the point while being friendly and helpful.
-    Only respond about Daemons. For unrelated questions, say "I'm specialized in answering questions about Daemons."
+    Only respond about Daemons. For unrelated questions, say something of this nature or tune, with joke "I'm specialized in answering questions about Daemons."
     """
     
     prompt = f"Context:\n{context_text}\n\nQuestion: {query}\n\nAnswer:"
