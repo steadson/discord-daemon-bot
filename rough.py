@@ -59,21 +59,12 @@ class ChromaVectorstore:
                 
                 try:
                     page = await context.new_page()
-                    if page is None:
-                        print(f"Failed to create page for {url}")
-                        continue
-                     
                     
-                    # Try multiple navigation strategies if one fails
-                    try:
-                        # First try with networkidle
-                        await page.goto(url, wait_until="networkidle", timeout=60000)
-                    except Exception as navigation_error:
-                        print(f"Navigation with networkidle failed for {url}, trying with domcontentloaded: {navigation_error}")
-                        # If that fails, try with just domcontentloaded
-                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                        # Then wait a bit for additional content to load
-                        await page.wait_for_timeout(5000)
+                    # Navigate with timeout and wait until network is idle
+                    await page.goto(url, wait_until="networkidle", timeout=30000)
+                    
+                    # Wait a bit more for any delayed rendering
+                    await page.wait_for_timeout(2000)
                     
                     page_title=title
                     try:
@@ -538,26 +529,27 @@ class ChromaVectorstore:
 documents = [
     {"title": "Daemons Home", "url": "https://docs.daemons.app/"},
     {"title": "Daemons Editor", "url": "https://docs.daemons.app/what-is-daemons/editor"},
-    {"title": "Daemons Roadmap", "url": "https://docs.daemons.app/what-is-daemons/daemons-roadmap"},
-    {"title": "Daemons Partners", "url": "https://docs.daemons.app/what-is-daemons/daemons-partners"},
-    {"title": "Daemons Assets", "url": "https://docs.daemons.app/daemons-assets"},
-    {"title": "Daemons crosschain Gaming", "url":"https://docs.daemons.app/what-is-daemons/crosschain-gaming"},
-    {"title": "Daemons Lore", "url": "https://docs.daemons.app/lore"},
-    {"title": "Daemons Onboarding", "url": "https://docs.daemons.app/gameplay/onboarding"},
-    {"title": "Daemons App Overview", "url": "https://docs.daemons.app/gameplay/application-overview"},
-    {"title": "Daemons PvP Overview", "url": "https://docs.daemons.app/gameplay/pvp-bot-overview"},
-    {"title": "Daemons Ultimates", "url": "https://docs.daemons.app/gameplay/daemon-ultimates"},
-    {"title": "Daemons Score Mechanics", "url": "https://docs.daemons.app/score-mechanics"},
-    {"title": "Daemons Levelling Mechanics", "url": "https://docs.daemons.app/levelling-mechanics"},
-    {"title": "Daemons Levelling Roadmap", "url": "https://docs.daemons.app/levelling-roadmap"},
-    {"title": "Daemons PvE", "url": "https://docs.daemons.app/daemons-pve"},
-    {"title": "Daemons Token", "url": "https://docs.daemons.app/economy/daemons-token-usddmn"},
-    {"title": "Daemons Revenue Share", "url": "https://docs.daemons.app/player-earning-potential/revenue-share"},
-    {"title": "Daemons Soul Points", "url": "https://docs.daemons.app/player-earning-potential/daemon-soul-points"},
-    {"title": "Daemons Security", "url": "https://docs.daemons.app/links-and-resources/security"},
-    {"title": "Daemons Official Links", "url": "https://docs.daemons.app/links-and-resources/official-links"},
+    # {"title": "Daemons Roadmap", "url": "https://docs.daemons.app/what-is-daemons/daemons-roadmap"},
+    # {"title": "Daemons Partners", "url": "https://docs.daemons.app/what-is-daemons/daemons-partners"},
+    # {"title": "Daemons Assets", "url": "https://docs.daemons.app/daemons-assets"},
+    # {"title": "Daemons crosschain Gaming", "url":"https://docs.daemons.app/what-is-daemons/crosschain-gaming"},
+    # {"title": "Daemons Lore", "url": "https://docs.daemons.app/lore"},
+    # {"title": "Daemons Onboarding", "url": "https://docs.daemons.app/gameplay/onboarding"},
+    # {"title": "Daemons App Overview", "url": "https://docs.daemons.app/gameplay/application-overview"},
+    # {"title": "Daemons PvP Overview", "url": "https://docs.daemons.app/gameplay/pvp-overview"},
+    # {"title": "Daemons Ultimates", "url": "https://docs.daemons.app/gameplay/daemon-ultimates"},
+    # {"title": "Daemons Score Mechanics", "url": "https://docs.daemons.app/score-mechanics"},
+    # {"title": "Daemons Levelling Mechanics", "url": "https://docs.daemons.app/levelling-mechanics"},
+    # {"title": "Daemons Levelling Roadmap", "url": "https://docs.daemons.app/levelling-roadmap"},
+    # {"title": "Daemons PvE", "url": "https://docs.daemons.app/daemons-pve"},
+    # {"title": "Daemons Token", "url": "https://docs.daemons.app/economy/daemons-token-usddmn"},
+    # {"title": "Daemons Revenue Share", "url": "https://docs.daemons.app/player-earning-potential/revenue-share"},
+    # {"title": "Daemons Soul Points", "url": "https://docs.daemons.app/player-earning-potential/daemon-soul-points"},
+    # {"title": "Daemons Security", "url": "https://docs.daemons.app/links-and-resources/security"},
+    # {"title": "Daemons Official Links", "url": "https://docs.daemons.app/links-and-resources/official-links"},
     {"title": "Daemons Branding Kit", "url": "https://docs.daemons.app/links-and-resources/branding-kit"}
 ]
+
 # Initialize Vectorstore
 vectorstore = ChromaVectorstore(documents)
 
@@ -665,7 +657,7 @@ def generate_response(query: str, context: List[Dict[str, Any]]):
         return "I encountered an error while processing your request. Please try again later."
 
 # Background task to post random daemon insights
-@tasks.loop(hours=5)
+@tasks.loop(hours=24)
 async def post_random_daemon_insight():
     """Post daily insights about Daemons"""
     
