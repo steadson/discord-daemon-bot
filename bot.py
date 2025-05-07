@@ -12,7 +12,9 @@ import requests
 import os
 import json
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+
+from urllib.parse import urlparse, urljoin
+import re
 import time
 import asyncio
 from playwright.async_api import async_playwright
@@ -31,14 +33,16 @@ bot_token = os.getenv("DISCORD_BOT_TOKEN")
 DAEMONS_API_URL = "https://docs.daemons.app/"  # Update with actual API endpoint if different
 
 class ChromaVectorstore:
-    def __init__(self, documents: List[Dict[str, str]], embedding_model="text-embedding-3-small"):
-        self.documents = documents
+    def __init__(self, base_url="https://docs.daemons.app/", embedding_model="text-embedding-3-small"):
+        self.base_url = base_url
         self.embedding_model = embedding_model
         self.client = OpenAI(api_key=openai_api_key)
         self.chroma_client = chromadb.PersistentClient(path="c:\\Users\\UK-PC\\Desktop\\discordBot\\chroma_db")
         self.collection_name = "daemons_docs"
         self.collection = None
         self.chunks = []
+        self.visited_urls = set()  # Track visited URLs
+        self.documents = []  # Will be populated by crawler
         self.build_vectorstore()
     # In the ChromaVectorstore class, modify the scrape_with_playwright method to improve chunking
 
@@ -339,6 +343,126 @@ class ChromaVectorstore:
         
         return results
 
+    async def crawl_website(self, max_pages=100):
+        """Crawl the website to find internal links and build the documents list"""
+        print(f"Starting web crawler from {self.base_url}")
+        
+        # Initialize with the base URL
+        to_visit = [{"title": "Daemons Home", "url": self.base_url}]
+        self.documents = []
+        self.visited_urls = set()
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            )
+            
+            page_count = 0
+            while to_visit and page_count < max_pages:
+                current = to_visit.pop(0)
+                current_url = current["url"]
+                
+                # Skip if already visited
+                if current_url in self.visited_urls:
+                    print(f"Skipping already visited: {current_url}")
+                    continue
+                
+                print(f"Crawling [{page_count+1}/{max_pages}]: {current_url}")
+                self.visited_urls.add(current_url)
+                self.documents.append(current)
+                page_count += 1
+                
+                # Visit the page and extract links
+                try:
+                    page = await context.new_page()
+                    await page.goto(current_url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(2000)  # Wait for dynamic content
+                    
+                    # Get page title
+                    page_title = await page.title()
+                    if page_title:
+                        current["title"] = page_title
+                    
+                    # Extract all links on the page
+                    links = await page.evaluate("""() => {
+                        const anchors = Array.from(document.querySelectorAll('a[href]'));
+                        return anchors.map(a => {
+                            return {
+                                href: a.href,
+                                text: a.textContent.trim()
+                            };
+                        });
+                    }""")
+                    
+                    # Process each link
+                    for link in links:
+                        href = link["href"]
+                        text = link["text"]
+                        
+                        # Parse the URL to check if it's internal
+                        parsed_url = urlparse(href)
+                        base_domain = urlparse(self.base_url).netloc
+                        
+                        # Only process internal links
+                        if parsed_url.netloc == base_domain:
+                            # Clean the URL (remove fragments)
+                            clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+                            
+                            # Skip if already visited or in queue
+                            if clean_url in self.visited_urls or any(item["url"] == clean_url for item in to_visit):
+                                continue
+                            
+                            # Use link text as title if available, otherwise use URL path
+                            title = text if text else parsed_url.path.split("/")[-1] or "Daemons Page"
+                            
+                            # Add to queue
+                            to_visit.append({"title": title, "url": clean_url})
+                            print(f"  Found new link: {clean_url} - '{title}'")
+                    
+                    await page.close()
+                    # Rate limiting
+                    await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    print(f"Error crawling {current_url}: {e}")
+                    await page.close()
+            
+            await context.close()
+            await browser.close()
+        
+        print(f"Crawling complete! Found {len(self.documents)} pages.")
+        return self.documents
+
+    async def async_process_documents(self):
+        """Process documents using Playwright for better handling of dynamic content"""
+        filename = "scraped_daemons_data.json"
+
+        # Try loading existing data first
+        cached_data = self.load_scraped_data(filename)
+        if cached_data:
+            self.chunks = cached_data
+            print(f"Loaded {len(self.chunks)} cached documents")
+            return
+
+        # Otherwise crawl the website first, then scrape with Playwright
+        print("No cached data found. Starting web crawler...")
+        
+        # Directly await the crawling function
+        await self.crawl_website()
+        
+        print(f"Crawling complete. Found {len(self.documents)} pages to scrape.")
+        
+        # Now scrape the discovered pages
+        self.chunks = await self.scrape_with_playwright(self.documents)
+        
+        print(f"Processed {len(self.chunks)} chunks from {len(self.documents)} documents")
+        
+        # Save the new data
+        self.save_scraped_data(self.chunks, filename)
+        
+        if self.chunks:
+            self.add_to_collection()
     def process_documents(self):
             """Process documents using Playwright for better handling of dynamic content"""
             filename = "scraped_daemons_data.json"
@@ -356,6 +480,11 @@ class ChromaVectorstore:
             # Run the async scraping function
             loop = asyncio.get_event_loop()
             asyncio.set_event_loop(loop)
+            self.chunks = loop.run_until_complete(self.scrape_with_playwright(self.documents))
+            
+            print(f"Crawling complete. Found {len(self.documents)} pages to scrape.")
+            
+            # Now scrape the discovered pages
             self.chunks = loop.run_until_complete(self.scrape_with_playwright(self.documents))
             
             print(f"Processed {len(self.chunks)} chunks from {len(self.documents)} documents")
@@ -535,31 +664,31 @@ class ChromaVectorstore:
                 return None
 
 # Define Daemons documents to scrape
-documents = [
-    {"title": "Daemons Home", "url": "https://docs.daemons.app/"},
-    {"title": "Daemons Editor", "url": "https://docs.daemons.app/what-is-daemons/editor"},
-    {"title": "Daemons Roadmap", "url": "https://docs.daemons.app/what-is-daemons/daemons-roadmap"},
-    {"title": "Daemons Partners", "url": "https://docs.daemons.app/what-is-daemons/daemons-partners"},
-    {"title": "Daemons Assets", "url": "https://docs.daemons.app/daemons-assets"},
-    {"title": "Daemons crosschain Gaming", "url":"https://docs.daemons.app/what-is-daemons/crosschain-gaming"},
-    {"title": "Daemons Lore", "url": "https://docs.daemons.app/lore"},
-    {"title": "Daemons Onboarding", "url": "https://docs.daemons.app/gameplay/onboarding"},
-    {"title": "Daemons App Overview", "url": "https://docs.daemons.app/gameplay/application-overview"},
-    {"title": "Daemons PvP Overview", "url": "https://docs.daemons.app/gameplay/pvp-bot-overview"},
-    {"title": "Daemons Ultimates", "url": "https://docs.daemons.app/gameplay/daemon-ultimates"},
-    {"title": "Daemons Score Mechanics", "url": "https://docs.daemons.app/score-mechanics"},
-    {"title": "Daemons Levelling Mechanics", "url": "https://docs.daemons.app/levelling-mechanics"},
-    {"title": "Daemons Levelling Roadmap", "url": "https://docs.daemons.app/levelling-roadmap"},
-    {"title": "Daemons PvE", "url": "https://docs.daemons.app/daemons-pve"},
-    {"title": "Daemons Token", "url": "https://docs.daemons.app/economy/daemons-token-usddmn"},
-    {"title": "Daemons Revenue Share", "url": "https://docs.daemons.app/player-earning-potential/revenue-share"},
-    {"title": "Daemons Soul Points", "url": "https://docs.daemons.app/player-earning-potential/daemon-soul-points"},
-    {"title": "Daemons Security", "url": "https://docs.daemons.app/links-and-resources/security"},
-    {"title": "Daemons Official Links", "url": "https://docs.daemons.app/links-and-resources/official-links"},
-    {"title": "Daemons Branding Kit", "url": "https://docs.daemons.app/links-and-resources/branding-kit"}
-]
+# documents = [
+#     {"title": "Daemons Home", "url": "https://docs.daemons.app/"},
+#     {"title": "Daemons Editor", "url": "https://docs.daemons.app/what-is-daemons/editor"},
+#     {"title": "Daemons Roadmap", "url": "https://docs.daemons.app/what-is-daemons/daemons-roadmap"},
+#     {"title": "Daemons Partners", "url": "https://docs.daemons.app/what-is-daemons/daemons-partners"},
+#     {"title": "Daemons Assets", "url": "https://docs.daemons.app/daemons-assets"},
+#     {"title": "Daemons crosschain Gaming", "url":"https://docs.daemons.app/what-is-daemons/crosschain-gaming"},
+#     {"title": "Daemons Lore", "url": "https://docs.daemons.app/lore"},
+#     {"title": "Daemons Onboarding", "url": "https://docs.daemons.app/gameplay/onboarding"},
+#     {"title": "Daemons App Overview", "url": "https://docs.daemons.app/gameplay/application-overview"},
+#     {"title": "Daemons PvP Overview", "url": "https://docs.daemons.app/gameplay/pvp-bot-overview"},
+#     {"title": "Daemons Ultimates", "url": "https://docs.daemons.app/gameplay/daemon-ultimates"},
+#     {"title": "Daemons Score Mechanics", "url": "https://docs.daemons.app/score-mechanics"},
+#     {"title": "Daemons Levelling Mechanics", "url": "https://docs.daemons.app/levelling-mechanics"},
+#     {"title": "Daemons Levelling Roadmap", "url": "https://docs.daemons.app/levelling-roadmap"},
+#     {"title": "Daemons PvE", "url": "https://docs.daemons.app/daemons-pve"},
+#     {"title": "Daemons Token", "url": "https://docs.daemons.app/economy/daemons-token-usddmn"},
+#     {"title": "Daemons Revenue Share", "url": "https://docs.daemons.app/player-earning-potential/revenue-share"},
+#     {"title": "Daemons Soul Points", "url": "https://docs.daemons.app/player-earning-potential/daemon-soul-points"},
+#     {"title": "Daemons Security", "url": "https://docs.daemons.app/links-and-resources/security"},
+#     {"title": "Daemons Official Links", "url": "https://docs.daemons.app/links-and-resources/official-links"},
+#     {"title": "Daemons Branding Kit", "url": "https://docs.daemons.app/links-and-resources/branding-kit"}
+# ]
 # Initialize Vectorstore
-vectorstore = ChromaVectorstore(documents)
+vectorstore = ChromaVectorstore(base_url="https://docs.daemons.app/")
 
 # Discord bot setup
 intents = discord.Intents.default()
@@ -705,10 +834,9 @@ async def auto_refresh_data():
     """Automatically refresh document data every 5 days"""
     print("Starting scheduled data refresh...")
     
-
     # Acquire lock before modifying vectorstore
     async with vectorstore_lock:
-    # Delete cached data file
+        # Delete cached data file
         try:
             if os.path.exists("scraped_daemons_data.json"):
                 os.remove("scraped_daemons_data.json")
@@ -717,78 +845,95 @@ async def auto_refresh_data():
             print(f"Error removing cache: {e}")
             return
     
-    # Reinitialize vectorstore
-    try:
-        global vectorstore
-        
-        # Create a custom version that properly handles async operations
-        class AsyncRefreshVectorstore(ChromaVectorstore):
-            # Override the build_vectorstore method to avoid calling process_documents
-            def build_vectorstore(self):
-                # Create or get collection
-                try:
-                    self.collection = self.chroma_client.get_or_create_collection(
-                        name=self.collection_name,
-                        metadata={"description": "Daemons documentation"}
-                    )
-                    print(f"Collection '{self.collection_name}' initialized")
-                except Exception as e:
-                    print(f"Error initializing ChromaDB collection: {e}")
-                    return
+        # Reinitialize vectorstore
+        try:
+            global vectorstore
             
-            async def async_process_documents(self):
-                """Process documents using Playwright for better handling of dynamic content"""
-                filename = "scraped_daemons_data.json"
-
-                # Try loading existing data first
-                cached_data = self.load_scraped_data(filename)
-                if cached_data:
-                    self.chunks = cached_data
-                    print(f"Loaded {len(self.chunks)} cached documents")
-                    return
-
-                # Otherwise scrape fresh data with Playwright
-                print("No cached data found. Scraping with Playwright...")
+            # Create a custom version that properly handles async operations
+            class AsyncRefreshVectorstore(ChromaVectorstore):
+                # Override the build_vectorstore method to avoid calling process_documents
+                def build_vectorstore(self):
+                    # Create or get collection
+                    try:
+                        self.collection = self.chroma_client.get_or_create_collection(
+                            name=self.collection_name,
+                            metadata={"description": "Daemons documentation"}
+                        )
+                        print(f"Collection '{self.collection_name}' initialized")
+                    except Exception as e:
+                        print(f"Error initializing ChromaDB collection: {e}")
+                        return
+                async def load_or_crawl_documents(self):
+                    """Either load previously crawled documents or crawl the site"""
+                    try:
+                        # Try to load existing crawled data
+                        if os.path.exists("crawled_urls.json"):
+                            with open("crawled_urls.json", "r") as f:
+                                data = json.load(f)
+                                
+                                # Check if the crawl data is recent (less than a day old)
+                                crawl_time = datetime.fromisoformat(data["timestamp"])
+                                if datetime.now() - crawl_time < timedelta(days=1):
+                                    print(f"✅ Using recent crawl data from {crawl_time}")
+                                    self.documents = data["documents"]
+                                    self.crawled_urls = set(data["crawled_urls"])
+                                    return self.documents
+                                else:
+                                    print(f"⚠️ Crawl data from {crawl_time} is too old. Recrawling...")
+                        else:
+                            print("No previous crawl data found. Starting new crawl...")
+                    except Exception as e:
+                        print(f"Error loading crawl data: {e}")
+                        print("Starting fresh crawl...")
+                    
+                    # If we get here, we need to crawl
+                    return await self.crawl_website()
                 
-                # Directly await the scraping function - no need for run_until_complete
-                self.chunks = await self.scrape_with_playwright(self.documents)
-                
-                print(f"Processed {len(self.chunks)} chunks from {len(self.documents)} documents")
-                
-                # Save the new data
-                self.save_scraped_data(self.chunks, filename)
-                
-                if self.chunks:
-                    self.add_to_collection()
-        
-        # Create the async-compatible vectorstore
-        temp_vectorstore = AsyncRefreshVectorstore(documents)
-        
-        # Process documents asynchronously
-        await temp_vectorstore.async_process_documents()
-        
-        # Replace the global vectorstore with our new one
-        vectorstore = temp_vectorstore
-        
-        # Send notification to admin channel if configured
-        channel_id = int(CHANNEL_ID) if CHANNEL_ID else None
-        if channel_id:
-            channel = bot.get_channel(channel_id)
-            if channel:
-                await channel.send("🔄 Scheduled data refresh completed successfully!")
-        
-        print("✅ Scheduled data refresh complete!")
-    except Exception as e:
-        import traceback
-        traceback_str = traceback.format_exc()
-        print(f"Scheduled refresh error: {e}\n{traceback_str}")
-        
-        # Send error notification to admin channel if configured
-        channel_id = int(CHANNEL_ID) if CHANNEL_ID else None
-        if channel_id:
-            channel = bot.get_channel(channel_id)
-            if channel:
-                await channel.send(f"❌ Scheduled data refresh failed: {str(e)}")
+                async def process_documents(self):
+                    """Process documents using Playwright for better handling of dynamic content"""
+                    # Get documents from crawler
+                    documents = await self.load_or_crawl_documents()
+                    
+                    # Now scrape the discovered pages
+                    self.chunks = await self.scrape_with_playwright(documents)
+                    
+                    print(f"Processed {len(self.chunks)} chunks from {len(documents)} documents")
+                    
+                    # Save the new data
+                    filename = "scraped_daemons_data.json"
+                    self.save_scraped_data(self.chunks, filename)
+                    
+                    if self.chunks:
+                        self.add_to_collection()
+            
+            # Create the async-compatible vectorstore with base_url instead of documents
+            temp_vectorstore = AsyncRefreshVectorstore(base_url="https://docs.daemons.app/")
+            
+            # Process documents asynchronously
+            await temp_vectorstore.process_documents()
+            
+            # Replace the global vectorstore with our new one
+            vectorstore = temp_vectorstore
+            
+            # Send notification to admin channel if configured
+            channel_id = int(CHANNEL_ID) if CHANNEL_ID else None
+            if channel_id:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    await channel.send("🔄 Scheduled data refresh completed successfully!")
+            
+            print("✅ Scheduled data refresh complete!")
+        except Exception as e:
+            import traceback
+            traceback_str = traceback.format_exc()
+            print(f"Scheduled refresh error: {e}\n{traceback_str}")
+            
+            # Send error notification to admin channel if configured
+            channel_id = int(CHANNEL_ID) if CHANNEL_ID else None
+            if channel_id:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    await channel.send(f"❌ Scheduled data refresh failed: {str(e)}")
 
 # Command to handle user queries
 @bot.command(name="daemon")
@@ -882,9 +1027,6 @@ async def refresh_data(ctx):
                     print(f"Error initializing ChromaDB collection: {e}")
                     return
                 
-                # Don't call process_documents here - we'll do it manually
-                # self.process_documents()
-                
             async def async_process_documents(self):
                 """Process documents using Playwright for better handling of dynamic content"""
                 filename = "scraped_daemons_data.json"
@@ -899,7 +1041,10 @@ async def refresh_data(ctx):
                 # Otherwise scrape fresh data with Playwright
                 print("No cached data found. Scraping with Playwright...")
                 
-                # Directly await the scraping function - no need for run_until_complete
+                # Directly await the crawling function
+                await self.crawl_website()
+                
+                # Now scrape the discovered pages
                 self.chunks = await self.scrape_with_playwright(self.documents)
                 
                 print(f"Processed {len(self.chunks)} chunks from {len(self.documents)} documents")
@@ -910,8 +1055,8 @@ async def refresh_data(ctx):
                 if self.chunks:
                     self.add_to_collection()
         
-        # Create the async-compatible vectorstore
-        temp_vectorstore = AsyncRefreshVectorstore(documents)
+        # Create the async-compatible vectorstore with base_url instead of documents
+        temp_vectorstore = AsyncRefreshVectorstore(base_url="https://docs.daemons.app/")
         
         # Process documents asynchronously
         await temp_vectorstore.async_process_documents()
